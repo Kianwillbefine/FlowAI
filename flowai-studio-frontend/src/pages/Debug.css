@@ -314,7 +314,8 @@
   border-radius: var(--c-radius-sm) !important;
 }
 
-.debug-send-btn {
+.debug-send-btn,
+.debug-stop-btn {
   flex-shrink: 0;
   height: 40px;
 }

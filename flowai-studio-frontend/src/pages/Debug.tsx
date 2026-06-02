@@ -13,6 +13,7 @@ import {
   LoadingOutlined,
   MinusCircleOutlined,
   ClearOutlined,
+  StopOutlined,
 } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
 import { useStore } from '../store'
@@ -23,6 +24,13 @@ import './Debug.css'
 const { Text, Paragraph } = Typography
 const { Option } = Select
 const CHAT_BOTTOM_THRESHOLD = 20
+
+const isAbortError = (error: unknown) => (
+  typeof error === 'object' &&
+  error !== null &&
+  'name' in error &&
+  (error as { name?: string }).name === 'AbortError'
+)
 
 interface ChatMessage {
   id: string
@@ -64,6 +72,7 @@ const Debug: React.FC = () => {
   const messagesContainerRef = useRef<HTMLDivElement>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
   const shouldFollowScrollRef = useRef(true)
+  const chatAbortControllerRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
     fetchApps()
@@ -75,6 +84,11 @@ const Debug: React.FC = () => {
       chatEndRef.current.scrollIntoView({ behavior: 'smooth' })
     }
   }, [messages, streamingContent])
+
+  useEffect(() => () => {
+    chatAbortControllerRef.current?.abort()
+    chatAbortControllerRef.current = null
+  }, [])
 
   const updateScrollFollowState = () => {
     const container = messagesContainerRef.current
@@ -141,8 +155,12 @@ const Debug: React.FC = () => {
     const trimmed = input.trim()
     if (!trimmed || isStreaming) return
 
+    const abortController = new AbortController()
+    chatAbortControllerRef.current = abortController
+
     // 立即清空输入框并设置流式状态
     const currentInput = trimmed
+    shouldFollowScrollRef.current = true
     setInput('')
     setIsStreaming(true)
     setStreamingContent('')
@@ -157,10 +175,29 @@ const Debug: React.FC = () => {
     setMessages(prev => [...prev, userMessage])
 
     const assistantMessageId = Date.now().toString() + '-assistant'
+    let accumulatedContent = ''
+    let references: any[] = []
+    let hasFinalizedAssistantMessage = false
+
+    const appendAssistantMessage = () => {
+      if (hasFinalizedAssistantMessage || !accumulatedContent) return
+      hasFinalizedAssistantMessage = true
+      setMessages(prev => [
+        ...prev,
+        {
+          id: assistantMessageId,
+          role: 'assistant',
+          content: accumulatedContent,
+          createdAt: new Date().toISOString(),
+          references,
+        },
+      ])
+    }
 
     try {
       const response = await fetch('/api/ai/chat', {
         method: 'POST',
+        signal: abortController.signal,
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${localStorage.getItem('token')}`,
@@ -177,28 +214,17 @@ const Debug: React.FC = () => {
       const reader = response.body?.getReader()
       if (!reader) throw new Error('No response body')
 
-      let accumulatedContent = ''
-      let references: any[] = []
-
       const parser = createParser((event) => {
         if (event.type === 'event') {
           try {
             const data = JSON.parse(event.data)
             if (data.type === 'text') {
+              if (abortController.signal.aborted) return
               accumulatedContent += data.content
               setStreamingContent(accumulatedContent)
             } else if (data.type === 'done') {
               references = data.references || []
-              setMessages(prev => [
-                ...prev,
-                {
-                  id: assistantMessageId,
-                  role: 'assistant',
-                  content: accumulatedContent,
-                  createdAt: new Date().toISOString(),
-                  references,
-                },
-              ])
+              appendAssistantMessage()
               setIsStreaming(false)
               setStreamingContent('')
             } else if (data.type === 'error') {
@@ -216,28 +242,34 @@ const Debug: React.FC = () => {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
+        if (abortController.signal.aborted) break
         parser.feed(decoder.decode(value))
       }
 
       // 流结束但没收到 done 事件：将已有内容保存为消息
-      if (isStreaming && accumulatedContent) {
-        setMessages(prev => [
-          ...prev,
-          {
-            id: assistantMessageId,
-            role: 'assistant',
-            content: accumulatedContent,
-            createdAt: new Date().toISOString(),
-          },
-        ])
+      if (abortController.signal.aborted) {
+        shouldFollowScrollRef.current = false
+      }
+      appendAssistantMessage()
+    } catch (error) {
+      if (isAbortError(error)) {
+        shouldFollowScrollRef.current = false
+        appendAssistantMessage()
+      } else {
+        message.error('发送消息失败')
+      }
+    } finally {
+      if (chatAbortControllerRef.current === abortController) {
+        chatAbortControllerRef.current = null
       }
       setIsStreaming(false)
       setStreamingContent('')
-    } catch {
-      message.error('发送消息失败')
-      setIsStreaming(false)
-      setStreamingContent('')
     }
+  }
+
+  const handleStopMessage = () => {
+    shouldFollowScrollRef.current = false
+    chatAbortControllerRef.current?.abort()
   }
 
   const handleRunWorkflow = async () => {
@@ -517,16 +549,26 @@ const Debug: React.FC = () => {
                   }
                 }}
               />
-              <Button
-                type="primary"
-                icon={<SendOutlined />}
-                onClick={handleSendMessage}
-                loading={isStreaming}
-                disabled={!input.trim()}
-                className="debug-send-btn"
-              >
-                发送
-              </Button>
+              {isStreaming ? (
+                <Button
+                  danger
+                  icon={<StopOutlined />}
+                  onClick={handleStopMessage}
+                  className="debug-stop-btn"
+                >
+                  停止
+                </Button>
+              ) : (
+                <Button
+                  type="primary"
+                  icon={<SendOutlined />}
+                  onClick={handleSendMessage}
+                  disabled={!input.trim()}
+                  className="debug-send-btn"
+                >
+                  发送
+                </Button>
+              )}
             </div>
           </div>
         </div>

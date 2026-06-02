@@ -6,6 +6,7 @@ import { StreamRunDto, RunDto, ChatDto } from './dto/ai.dto';
 import { RAGService } from '../rag/services/rag.service';
 import { WorkflowExecutorService } from '../workflow/services/workflow-executor.service';
 import { Subject } from 'rxjs';
+import { Readable } from 'stream';
 import axios from 'axios';
 
 @Injectable()
@@ -142,6 +143,27 @@ export class AiService {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
+    const abortController = new AbortController();
+    let isClientClosed = false;
+    let isResponseEnded = false;
+    let upstreamStream: Readable | null = null;
+
+    const finishResponse = () => {
+      if (!isResponseEnded && !res.destroyed) {
+        isResponseEnded = true;
+        res.end();
+      }
+    };
+
+    const handleClientClose = () => {
+      if (isResponseEnded) return;
+      isClientClosed = true;
+      abortController.abort();
+      upstreamStream?.destroy();
+    };
+
+    res.on('close', handleClientClose);
+
     try {
       const { message, history = [], sessionId = Date.now().toString(), knowledgeBaseId } = chatDto;
       const apiKey = this.configService.get<string>('QWEN_API_KEY');
@@ -181,6 +203,7 @@ export class AiService {
         `${baseUrl}/chat/completions`,
         { model: 'qwen-turbo', messages, stream: true },
         {
+          signal: abortController.signal,
           headers: {
             Authorization: `Bearer ${apiKey}`,
             'Content-Type': 'application/json',
@@ -189,56 +212,73 @@ export class AiService {
           timeout: 30000,
         },
       );
+      upstreamStream = response.data;
 
       let fullAssistantContent = '';
 
-      response.data.on('data', (chunk: Buffer) => {
-        const lines = chunk.toString().split('\n').filter((line) => line.trim() !== '');
-        for (const line of lines) {
-          if (line.includes('[DONE]')) continue;
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              const content = data.choices[0]?.delta?.content || '';
-              if (content) {
-                fullAssistantContent += content;
-                res.write(`data: ${JSON.stringify({ type: 'text', content })}\n\n`);
+      await new Promise<void>((resolve) => {
+        response.data.on('data', (chunk: Buffer) => {
+          if (isClientClosed || res.destroyed) return;
+          const lines = chunk.toString().split('\n').filter((line) => line.trim() !== '');
+          for (const line of lines) {
+            if (line.includes('[DONE]')) continue;
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                const content = data.choices[0]?.delta?.content || '';
+                if (content) {
+                  fullAssistantContent += content;
+                  res.write(`data: ${JSON.stringify({ type: 'text', content })}\n\n`);
+                }
+              } catch {
+                // 忽略解析错误
               }
-            } catch {
-              // 忽略解析错误
             }
           }
-        }
-      });
+        });
 
-      response.data.on('end', async () => {
-        // 保存助手回复（非阻塞）
-        this.prisma.chatHistory.create({
-          data: {
-            sessionId,
-            role: 'assistant',
-            content: fullAssistantContent,
-            userId,
-            references: JSON.stringify(references),
-          },
-        }).catch((e) => console.error('保存助手消息失败:', e.message));
+        response.data.on('end', () => {
+          if (!isClientClosed && !res.destroyed) {
+            // 保存助手回复（非阻塞）
+            this.prisma.chatHistory.create({
+              data: {
+                sessionId,
+                role: 'assistant',
+                content: fullAssistantContent,
+                userId,
+                references: JSON.stringify(references),
+              },
+            }).catch((e) => console.error('保存助手消息失败:', e.message));
 
-        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-        res.end();
-      });
+            res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+            finishResponse();
+          }
+          resolve();
+        });
 
-      response.data.on('error', (err: Error) => {
-        console.error('Qwen 流式响应错误:', err.message);
-        const safeMsg = (err.message || '流式响应异常').replace(/[\n\r]/g, ' ');
-        res.write(`data: ${JSON.stringify({ type: 'error', message: safeMsg })}\n\n`);
-        res.end();
+        response.data.on('error', (err: Error) => {
+          if (!isClientClosed && !res.destroyed) {
+            console.error('Qwen 流式响应错误:', err.message);
+            const safeMsg = (err.message || '流式响应异常').replace(/[\n\r]/g, ' ');
+            res.write(`data: ${JSON.stringify({ type: 'error', message: safeMsg })}\n\n`);
+            finishResponse();
+          }
+          resolve();
+        });
+
+        response.data.on('close', () => {
+          resolve();
+        });
       });
 
     } catch (error) {
+      if (isClientClosed || abortController.signal.aborted || res.destroyed) return;
       console.error('Chat error:', error);
       const safeMsg = (error instanceof Error ? error.message : 'Unknown error').replace(/[\n\r]/g, ' ');
       res.write(`data: ${JSON.stringify({ type: 'error', message: safeMsg })}\n\n`);
-      res.end();
+      finishResponse();
+    } finally {
+      res.off('close', handleClientClose);
     }
   }
 

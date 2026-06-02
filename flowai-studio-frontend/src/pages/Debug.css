@@ -114,13 +114,24 @@
 /* Messages */
 .debug-messages {
   flex: 1;
-  padding: 20px;
-  overflow-y: auto;
+  overflow: hidden;
   min-height: 300px;
   max-height: 480px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+}
+
+.chat-virtual-row {
+  box-sizing: border-box;
+  padding: 0 20px 16px;
+}
+
+.chat-virtual-row--first {
+  padding-top: 20px;
+}
+
+.chat-virtual-row--last {
+  padding-bottom: 20px;
 }
 
 /* Empty state */

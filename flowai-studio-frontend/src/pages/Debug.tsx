@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo, useCallback, useLayoutEffect } from 'react'
+import type { CSSProperties } from 'react'
 import { Typography, Input, Button, Select, Divider, message, Empty } from 'antd'
 import {
   SendOutlined,
@@ -16,6 +17,8 @@ import {
   StopOutlined,
 } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
+import { List } from 'react-window'
+import type { DynamicRowHeight, ListImperativeAPI } from 'react-window'
 import { useStore } from '../store'
 import request from '../utils/axios'
 import { createParser } from 'eventsource-parser'
@@ -24,6 +27,11 @@ import './Debug.css'
 const { Text, Paragraph } = Typography
 const { Option } = Select
 const CHAT_BOTTOM_THRESHOLD = 20
+const CHAT_LIST_HEIGHT = 480
+const CHAT_ROW_ESTIMATED_HEIGHT = 112
+const CHAT_ROW_OVERSCAN = 4
+const CHAT_LIST_STYLE: CSSProperties = { height: CHAT_LIST_HEIGHT }
+const REACT_WINDOW_INDEX_ATTR = 'data-react-window-index'
 
 const isAbortError = (error: unknown) => (
   typeof error === 'object' &&
@@ -52,6 +60,249 @@ interface NodeExecState {
   error?: string
 }
 
+type ChatRow =
+  | { id: string; type: 'message'; message: ChatMessage }
+  | { id: string; type: 'streaming'; content: string }
+
+interface PositionCacheItem {
+  height: number
+  top: number
+}
+
+const getResizeEntryHeight = (entry: ResizeObserverEntry) => {
+  const borderBoxSize = entry.borderBoxSize
+  if (Array.isArray(borderBoxSize) && borderBoxSize[0]?.blockSize) {
+    return borderBoxSize[0].blockSize
+  }
+
+  const singleBorderBoxSize = borderBoxSize as unknown as ResizeObserverSize | undefined
+  if (singleBorderBoxSize?.blockSize) {
+    return singleBorderBoxSize.blockSize
+  }
+
+  return entry.target.getBoundingClientRect().height || entry.contentRect.height
+}
+
+// Dynamic row height cache: estimated first, then corrected by ResizeObserver after layout.
+const useMeasuredRowHeightCache = (rowCount: number, estimatedHeight: number) => {
+  const cacheRef = useRef<PositionCacheItem[]>([])
+  const observerRef = useRef<ResizeObserver | null>(null)
+  const resizeCallbackRef = useRef<(entries: ResizeObserverEntry[]) => void>(() => {})
+  const [version, setVersion] = useState(0)
+
+  const ensureCache = useCallback(() => {
+    const cache = cacheRef.current
+
+    if (cache.length > rowCount) {
+      cache.length = rowCount
+    }
+
+    for (let index = cache.length; index < rowCount; index += 1) {
+      const previous = cache[index - 1]
+      cache[index] = {
+        height: estimatedHeight,
+        top: previous ? previous.top + previous.height : 0,
+      }
+    }
+
+    return cache
+  }, [estimatedHeight, rowCount])
+
+  const updateMeasuredHeight = useCallback((index: number, height: number) => {
+    if (!Number.isFinite(height) || index < 0 || index >= rowCount) return false
+
+    const nextHeight = Math.max(1, Math.ceil(height))
+    const cache = ensureCache()
+    const item = cache[index]
+
+    if (!item || Math.abs(item.height - nextHeight) < 1) return false
+
+    const delta = nextHeight - item.height
+    item.height = nextHeight
+
+    for (let cursor = index + 1; cursor < cache.length; cursor += 1) {
+      cache[cursor].top += delta
+    }
+
+    return true
+  }, [ensureCache, rowCount])
+
+  const setRowHeight = useCallback((index: number, size: number) => {
+    if (updateMeasuredHeight(index, size)) {
+      setVersion((current) => current + 1)
+    }
+  }, [updateMeasuredHeight])
+
+  const getRowHeight = useCallback((index: number) => {
+    return ensureCache()[index]?.height ?? estimatedHeight
+  }, [ensureCache, estimatedHeight])
+
+  const getAverageRowHeight = useCallback(() => {
+    const cache = ensureCache()
+    if (cache.length === 0) return estimatedHeight
+
+    return cache.reduce((total, item) => total + item.height, 0) / cache.length
+  }, [ensureCache, estimatedHeight])
+
+  useLayoutEffect(() => {
+    resizeCallbackRef.current = (entries: ResizeObserverEntry[]) => {
+      let didUpdate = false
+
+      entries.forEach((entry) => {
+        const indexAttr = entry.target.getAttribute(REACT_WINDOW_INDEX_ATTR)
+        if (indexAttr === null) return
+
+        const index = Number(indexAttr)
+        if (!Number.isInteger(index)) return
+
+        didUpdate = updateMeasuredHeight(index, getResizeEntryHeight(entry)) || didUpdate
+      })
+
+      if (didUpdate) {
+        setVersion((current) => current + 1)
+      }
+    }
+  }, [updateMeasuredHeight])
+
+  useEffect(() => {
+    ensureCache()
+  }, [ensureCache])
+
+  useEffect(() => () => {
+    observerRef.current?.disconnect()
+    observerRef.current = null
+  }, [])
+
+  const observeRowElements = useCallback((elements: Element[] | NodeListOf<Element>) => {
+    if (typeof ResizeObserver === 'undefined') return () => {}
+
+    if (!observerRef.current) {
+      observerRef.current = new ResizeObserver((entries) => resizeCallbackRef.current(entries))
+    }
+
+    const observer = observerRef.current
+    const rows = Array.from(elements)
+    rows.forEach((element) => observer.observe(element))
+
+    return () => {
+      rows.forEach((element) => observer.unobserve(element))
+    }
+  }, [])
+
+  const rowHeight = useMemo<DynamicRowHeight>(() => ({
+    getAverageRowHeight,
+    getRowHeight,
+    setRowHeight,
+    observeRowElements,
+  }), [getAverageRowHeight, getRowHeight, observeRowElements, setRowHeight, version])
+
+  return { rowHeight, version }
+}
+
+const ChatMessageItem = ({ msg }: { msg: ChatMessage }) => (
+  <div className={`chat-msg chat-msg--${msg.role}`}>
+    <div className={`chat-avatar chat-avatar--${msg.role}`}>
+      {msg.role === 'user' ? <UserOutlined /> : <RobotOutlined />}
+    </div>
+    <div className="chat-body">
+      <div className="chat-meta">
+        <span className="chat-name">{msg.role === 'user' ? '我' : 'AI 助手'}</span>
+        <span className="chat-time">
+          {new Date(msg.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+        </span>
+      </div>
+      <div className={`chat-bubble chat-bubble--${msg.role}`}>
+        {msg.role === 'assistant' ? (
+          <div className="chat-markdown">
+            <ReactMarkdown>{msg.content}</ReactMarkdown>
+          </div>
+        ) : (
+          <Paragraph style={{ margin: 0 }}>{msg.content}</Paragraph>
+        )}
+
+        {msg.references && msg.references.length > 0 && (
+          <div className="chat-refs">
+            <div className="chat-refs-label">
+              <FileSearchOutlined />
+              引用了 {msg.references.length} 份文档
+            </div>
+            {msg.references.map((ref, idx) => (
+              <div key={idx} className="chat-ref-item">
+                <div className="chat-ref-head">
+                  <Text strong style={{ fontSize: 12 }}>{ref.documentName}</Text>
+                  <span className="chat-ref-score">
+                    {Math.round(ref.similarity * 100)}% 相似
+                  </span>
+                </div>
+                <Paragraph
+                  ellipsis={{ rows: 2 }}
+                  style={{ margin: 0, fontSize: 12, color: 'var(--c-text-secondary)' }}
+                >
+                  {ref.content}
+                </Paragraph>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  </div>
+)
+
+const StreamingChatMessage = ({ content }: { content: string }) => (
+  <div className="chat-msg chat-msg--assistant">
+    <div className="chat-avatar chat-avatar--assistant chat-avatar--streaming">
+      <RobotOutlined />
+    </div>
+    <div className="chat-body">
+      <div className="chat-meta">
+        <span className="chat-name">AI 助手</span>
+        <span className="chat-streaming-label">生成中…</span>
+      </div>
+      <div className="chat-bubble chat-bubble--assistant">
+        <div className="chat-markdown">
+          <ReactMarkdown>{content || '…'}</ReactMarkdown>
+        </div>
+      </div>
+    </div>
+  </div>
+)
+
+interface ChatVirtualRowProps {
+  rows: ChatRow[]
+}
+
+interface ChatVirtualRowRenderProps extends ChatVirtualRowProps {
+  ariaAttributes: {
+    'aria-posinset': number
+    'aria-setsize': number
+    role: 'listitem'
+  }
+  index: number
+  style: CSSProperties
+}
+
+const ChatVirtualRow = ({ ariaAttributes, index, rows, style }: ChatVirtualRowRenderProps) => {
+  const row = rows[index]
+  if (!row) return null
+
+  return (
+    <div
+      {...ariaAttributes}
+      style={style}
+      className={`chat-virtual-row ${index === 0 ? 'chat-virtual-row--first' : ''} ${index === rows.length - 1 ? 'chat-virtual-row--last' : ''}`}
+    >
+      <div className="chat-virtual-row-inner">
+        {row.type === 'message' ? (
+          <ChatMessageItem msg={row.message} />
+        ) : (
+          <StreamingChatMessage content={row.content} />
+        )}
+      </div>
+    </div>
+  )
+}
+
 const Debug: React.FC = () => {
   const { isLoading, setIsLoading, apps, fetchApps, knowledgeBases, fetchKnowledgeBases } = useStore()
   const [input, setInput] = useState('')
@@ -69,21 +320,49 @@ const Debug: React.FC = () => {
   const [wfStatus, setWfStatus] = useState<'idle' | 'running' | 'success' | 'failed'>('idle')
   const [isStreaming, setIsStreaming] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
-  const messagesContainerRef = useRef<HTMLDivElement>(null)
-  const chatEndRef = useRef<HTMLDivElement>(null)
+  const chatListRef = useRef<ListImperativeAPI | null>(null)
   const shouldFollowScrollRef = useRef(true)
   const chatAbortControllerRef = useRef<AbortController | null>(null)
+  const chatRows = useMemo<ChatRow[]>(() => [
+    ...messages.map((msg) => ({
+      id: msg.id,
+      type: 'message' as const,
+      message: msg,
+    })),
+    ...(isStreaming ? [{
+      id: 'streaming-assistant',
+      type: 'streaming' as const,
+      content: streamingContent,
+    }] : []),
+  ], [isStreaming, messages, streamingContent])
+  const { rowHeight: chatRowHeight, version: chatRowHeightVersion } = useMeasuredRowHeightCache(
+    chatRows.length,
+    CHAT_ROW_ESTIMATED_HEIGHT,
+  )
+  const chatRowProps = useMemo(() => ({ rows: chatRows }), [chatRows])
 
   useEffect(() => {
     fetchApps()
     fetchKnowledgeBases()
   }, [fetchApps, fetchKnowledgeBases])
 
+  const scrollChatToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
+    if (chatRows.length === 0) return
+
+    requestAnimationFrame(() => {
+      chatListRef.current?.scrollToRow({
+        align: 'end',
+        behavior,
+        index: chatRows.length - 1,
+      })
+    })
+  }, [chatRows.length])
+
   useEffect(() => {
-    if (shouldFollowScrollRef.current && chatEndRef.current) {
-      chatEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    if (shouldFollowScrollRef.current) {
+      scrollChatToBottom('auto')
     }
-  }, [messages, streamingContent])
+  }, [chatRows.length, chatRowHeightVersion, scrollChatToBottom, streamingContent])
 
   useEffect(() => () => {
     chatAbortControllerRef.current?.abort()
@@ -91,7 +370,7 @@ const Debug: React.FC = () => {
   }, [])
 
   const updateScrollFollowState = () => {
-    const container = messagesContainerRef.current
+    const container = chatListRef.current?.element
     if (!container) return
 
     const { scrollHeight, clientHeight, scrollTop } = container
@@ -430,12 +709,8 @@ const Debug: React.FC = () => {
       {activeTab === 'chat' && (
         <div className="debug-chat-card">
           {/* 消息列表 */}
-          <div
-            ref={messagesContainerRef}
-            className="debug-messages"
-            onScroll={updateScrollFollowState}
-          >
-            {messages.length === 0 && !streamingContent ? (
+          <div className="debug-messages">
+            {chatRows.length === 0 ? (
               <div className="debug-empty">
                 <RobotOutlined className="debug-empty-icon" />
                 <Text strong style={{ color: 'var(--c-text-primary)' }}>发送消息开始调试</Text>
@@ -444,77 +719,18 @@ const Debug: React.FC = () => {
                 </Text>
               </div>
             ) : (
-              <>
-                {messages.map((msg) => (
-                  <div key={msg.id} className={`chat-msg chat-msg--${msg.role}`}>
-                    <div className={`chat-avatar chat-avatar--${msg.role}`}>
-                      {msg.role === 'user' ? <UserOutlined /> : <RobotOutlined />}
-                    </div>
-                    <div className="chat-body">
-                      <div className="chat-meta">
-                        <span className="chat-name">{msg.role === 'user' ? '我' : 'AI 助手'}</span>
-                        <span className="chat-time">
-                          {new Date(msg.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
-                        </span>
-                      </div>
-                      <div className={`chat-bubble chat-bubble--${msg.role}`}>
-                        {msg.role === 'assistant' ? (
-                          <div className="chat-markdown">
-                            <ReactMarkdown>{msg.content}</ReactMarkdown>
-                          </div>
-                        ) : (
-                          <Paragraph style={{ margin: 0 }}>{msg.content}</Paragraph>
-                        )}
-
-                        {msg.references && msg.references.length > 0 && (
-                          <div className="chat-refs">
-                            <div className="chat-refs-label">
-                              <FileSearchOutlined />
-                              引用了 {msg.references.length} 份文档
-                            </div>
-                            {msg.references.map((ref, idx) => (
-                              <div key={idx} className="chat-ref-item">
-                                <div className="chat-ref-head">
-                                  <Text strong style={{ fontSize: 12 }}>{ref.documentName}</Text>
-                                  <span className="chat-ref-score">
-                                    {Math.round(ref.similarity * 100)}% 相似
-                                  </span>
-                                </div>
-                                <Paragraph
-                                  ellipsis={{ rows: 2 }}
-                                  style={{ margin: 0, fontSize: 12, color: 'var(--c-text-secondary)' }}
-                                >
-                                  {ref.content}
-                                </Paragraph>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                ))}
-
-                {isStreaming && (
-                  <div className="chat-msg chat-msg--assistant">
-                    <div className="chat-avatar chat-avatar--assistant chat-avatar--streaming">
-                      <RobotOutlined />
-                    </div>
-                    <div className="chat-body">
-                      <div className="chat-meta">
-                        <span className="chat-name">AI 助手</span>
-                        <span className="chat-streaming-label">生成中…</span>
-                      </div>
-                      <div className="chat-bubble chat-bubble--assistant">
-                        <div className="chat-markdown">
-                          <ReactMarkdown>{streamingContent || '…'}</ReactMarkdown>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
-                <div ref={chatEndRef} />
-              </>
+              <List<ChatVirtualRowProps>
+                className="debug-message-list"
+                defaultHeight={CHAT_LIST_HEIGHT}
+                listRef={chatListRef}
+                onScroll={updateScrollFollowState}
+                overscanCount={CHAT_ROW_OVERSCAN}
+                rowComponent={ChatVirtualRow}
+                rowCount={chatRows.length}
+                rowHeight={chatRowHeight}
+                rowProps={chatRowProps}
+                style={CHAT_LIST_STYLE}
+              />
             )}
           </div>
 

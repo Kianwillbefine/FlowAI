@@ -22,6 +22,7 @@ import './Debug.css'
 
 const { Text, Paragraph } = Typography
 const { Option } = Select
+const CHAT_BOTTOM_THRESHOLD = 20
 
 interface ChatMessage {
   id: string
@@ -60,7 +61,9 @@ const Debug: React.FC = () => {
   const [wfStatus, setWfStatus] = useState<'idle' | 'running' | 'success' | 'failed'>('idle')
   const [isStreaming, setIsStreaming] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
+  const messagesContainerRef = useRef<HTMLDivElement>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
+  const shouldFollowScrollRef = useRef(true)
 
   useEffect(() => {
     fetchApps()
@@ -68,10 +71,19 @@ const Debug: React.FC = () => {
   }, [fetchApps, fetchKnowledgeBases])
 
   useEffect(() => {
-    if (chatEndRef.current) {
+    if (shouldFollowScrollRef.current && chatEndRef.current) {
       chatEndRef.current.scrollIntoView({ behavior: 'smooth' })
     }
   }, [messages, streamingContent])
+
+  const updateScrollFollowState = () => {
+    const container = messagesContainerRef.current
+    if (!container) return
+
+    const { scrollHeight, clientHeight, scrollTop } = container
+    const distanceToBottom = scrollHeight - (scrollTop + clientHeight)
+    shouldFollowScrollRef.current = distanceToBottom < CHAT_BOTTOM_THRESHOLD
+  }
 
   const handleAppChange = async (appId: string) => {
     setSelectedAppId(appId)
@@ -386,7 +398,11 @@ const Debug: React.FC = () => {
       {activeTab === 'chat' && (
         <div className="debug-chat-card">
           {/* 消息列表 */}
-          <div className="debug-messages">
+          <div
+            ref={messagesContainerRef}
+            className="debug-messages"
+            onScroll={updateScrollFollowState}
+          >
             {messages.length === 0 && !streamingContent ? (
               <div className="debug-empty">
                 <RobotOutlined className="debug-empty-icon" />

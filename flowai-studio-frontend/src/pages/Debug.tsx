@@ -30,7 +30,7 @@ const CHAT_BOTTOM_THRESHOLD = 20
 const CHAT_LIST_HEIGHT = 480
 const CHAT_ROW_ESTIMATED_HEIGHT = 112
 const CHAT_ROW_OVERSCAN = 4
-const CHAT_LIST_STYLE: CSSProperties = { height: CHAT_LIST_HEIGHT }
+const CHAT_LIST_STYLE: CSSProperties = { height: CHAT_LIST_HEIGHT, width: '100%' }
 const REACT_WINDOW_INDEX_ATTR = 'data-react-window-index'
 
 const isAbortError = (error: unknown) => (
@@ -322,6 +322,8 @@ const Debug: React.FC = () => {
   const [streamingContent, setStreamingContent] = useState('')
   const chatListRef = useRef<ListImperativeAPI | null>(null)
   const shouldFollowScrollRef = useRef(true)
+  const userScrollIntentRef = useRef(false)
+  const userScrollIntentTimeoutRef = useRef<number | null>(null)
   const chatAbortControllerRef = useRef<AbortController | null>(null)
   const chatRows = useMemo<ChatRow[]>(() => [
     ...messages.map((msg) => ({
@@ -367,9 +369,34 @@ const Debug: React.FC = () => {
   useEffect(() => () => {
     chatAbortControllerRef.current?.abort()
     chatAbortControllerRef.current = null
+    if (userScrollIntentTimeoutRef.current !== null) {
+      window.clearTimeout(userScrollIntentTimeoutRef.current)
+      userScrollIntentTimeoutRef.current = null
+    }
   }, [])
 
+  const markUserScrollIntent = useCallback(() => {
+    userScrollIntentRef.current = true
+
+    if (userScrollIntentTimeoutRef.current !== null) {
+      window.clearTimeout(userScrollIntentTimeoutRef.current)
+    }
+
+    userScrollIntentTimeoutRef.current = window.setTimeout(() => {
+      userScrollIntentRef.current = false
+      userScrollIntentTimeoutRef.current = null
+    }, 250)
+  }, [])
+
+  const handleChatScrollKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
+      markUserScrollIntent()
+    }
+  }, [markUserScrollIntent])
+
   const updateScrollFollowState = () => {
+    if (!userScrollIntentRef.current) return
+
     const container = chatListRef.current?.element
     if (!container) return
 
@@ -723,7 +750,11 @@ const Debug: React.FC = () => {
                 className="debug-message-list"
                 defaultHeight={CHAT_LIST_HEIGHT}
                 listRef={chatListRef}
+                onKeyDown={handleChatScrollKeyDown}
+                onMouseDown={markUserScrollIntent}
                 onScroll={updateScrollFollowState}
+                onTouchStart={markUserScrollIntent}
+                onWheel={markUserScrollIntent}
                 overscanCount={CHAT_ROW_OVERSCAN}
                 rowComponent={ChatVirtualRow}
                 rowCount={chatRows.length}

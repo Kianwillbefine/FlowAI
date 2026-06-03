@@ -16,9 +16,9 @@ import {
   ClearOutlined,
   StopOutlined,
 } from '@ant-design/icons'
-import ReactMarkdown from 'react-markdown'
 import { List } from 'react-window'
 import type { DynamicRowHeight, ListImperativeAPI } from 'react-window'
+import MarkdownRenderer from '../components/MarkdownRenderer'
 import { useStore } from '../store'
 import request from '../utils/axios'
 import { createParser } from 'eventsource-parser'
@@ -213,9 +213,7 @@ const ChatMessageItem = ({ msg }: { msg: ChatMessage }) => (
       </div>
       <div className={`chat-bubble chat-bubble--${msg.role}`}>
         {msg.role === 'assistant' ? (
-          <div className="chat-markdown">
-            <ReactMarkdown>{msg.content}</ReactMarkdown>
-          </div>
+          <MarkdownRenderer content={msg.content} />
         ) : (
           <Paragraph style={{ margin: 0 }}>{msg.content}</Paragraph>
         )}
@@ -260,9 +258,7 @@ const StreamingChatMessage = ({ content }: { content: string }) => (
         <span className="chat-streaming-label">生成中…</span>
       </div>
       <div className="chat-bubble chat-bubble--assistant">
-        <div className="chat-markdown">
-          <ReactMarkdown>{content || '…'}</ReactMarkdown>
-        </div>
+        <MarkdownRenderer content={content || '…'} />
       </div>
     </div>
   </div>

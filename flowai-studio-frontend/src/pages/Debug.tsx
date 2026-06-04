@@ -321,6 +321,9 @@ const Debug: React.FC = () => {
   const userScrollIntentRef = useRef(false)
   const userScrollIntentTimeoutRef = useRef<number | null>(null)
   const chatAbortControllerRef = useRef<AbortController | null>(null)
+  const chatStreamContentRef = useRef('')
+  const chatStreamDisplayBufferRef = useRef('')
+  const chatStreamFrameRef = useRef<number | null>(null)
   const chatRows = useMemo<ChatRow[]>(() => [
     ...messages.map((msg) => ({
       id: msg.id,
@@ -338,6 +341,43 @@ const Debug: React.FC = () => {
     CHAT_ROW_ESTIMATED_HEIGHT,
   )
   const chatRowProps = useMemo(() => ({ rows: chatRows }), [chatRows])
+
+  const cancelChatStreamFrame = useCallback(() => {
+    if (chatStreamFrameRef.current !== null) {
+      window.cancelAnimationFrame(chatStreamFrameRef.current)
+      chatStreamFrameRef.current = null
+    }
+  }, [])
+
+  const resetChatStreamBuffer = useCallback(() => {
+    cancelChatStreamFrame()
+    chatStreamContentRef.current = ''
+    chatStreamDisplayBufferRef.current = ''
+    setStreamingContent('')
+  }, [cancelChatStreamFrame])
+
+  const scheduleChatStreamFlush = useCallback(() => {
+    chatStreamDisplayBufferRef.current = chatStreamContentRef.current
+
+    if (chatStreamFrameRef.current !== null) return
+
+    chatStreamFrameRef.current = window.requestAnimationFrame(() => {
+      chatStreamFrameRef.current = null
+      setStreamingContent(chatStreamDisplayBufferRef.current)
+    })
+  }, [])
+
+  const flushChatStreamContent = useCallback(() => {
+    cancelChatStreamFrame()
+    chatStreamDisplayBufferRef.current = chatStreamContentRef.current
+    setStreamingContent(chatStreamDisplayBufferRef.current)
+  }, [cancelChatStreamFrame])
+
+  const clearChatStreamDisplay = useCallback(() => {
+    cancelChatStreamFrame()
+    chatStreamDisplayBufferRef.current = ''
+    setStreamingContent('')
+  }, [cancelChatStreamFrame])
 
   useEffect(() => {
     fetchApps()
@@ -365,6 +405,12 @@ const Debug: React.FC = () => {
   useEffect(() => () => {
     chatAbortControllerRef.current?.abort()
     chatAbortControllerRef.current = null
+    if (chatStreamFrameRef.current !== null) {
+      window.cancelAnimationFrame(chatStreamFrameRef.current)
+      chatStreamFrameRef.current = null
+    }
+    chatStreamContentRef.current = ''
+    chatStreamDisplayBufferRef.current = ''
     if (userScrollIntentTimeoutRef.current !== null) {
       window.clearTimeout(userScrollIntentTimeoutRef.current)
       userScrollIntentTimeoutRef.current = null
@@ -463,9 +509,9 @@ const Debug: React.FC = () => {
     // 立即清空输入框并设置流式状态
     const currentInput = trimmed
     shouldFollowScrollRef.current = true
+    resetChatStreamBuffer()
     setInput('')
     setIsStreaming(true)
-    setStreamingContent('')
 
     const userMessage: ChatMessage = {
       id: Date.now().toString(),
@@ -477,19 +523,19 @@ const Debug: React.FC = () => {
     setMessages(prev => [...prev, userMessage])
 
     const assistantMessageId = Date.now().toString() + '-assistant'
-    let accumulatedContent = ''
     let references: any[] = []
     let hasFinalizedAssistantMessage = false
 
     const appendAssistantMessage = () => {
-      if (hasFinalizedAssistantMessage || !accumulatedContent) return
+      const assistantContent = chatStreamContentRef.current
+      if (hasFinalizedAssistantMessage || !assistantContent) return
       hasFinalizedAssistantMessage = true
       setMessages(prev => [
         ...prev,
         {
           id: assistantMessageId,
           role: 'assistant',
-          content: accumulatedContent,
+          content: assistantContent,
           createdAt: new Date().toISOString(),
           references,
         },
@@ -522,17 +568,18 @@ const Debug: React.FC = () => {
             const data = JSON.parse(event.data)
             if (data.type === 'text') {
               if (abortController.signal.aborted) return
-              accumulatedContent += data.content
-              setStreamingContent(accumulatedContent)
+              chatStreamContentRef.current += data.content
+              scheduleChatStreamFlush()
             } else if (data.type === 'done') {
               references = data.references || []
+              flushChatStreamContent()
               appendAssistantMessage()
               setIsStreaming(false)
-              setStreamingContent('')
+              clearChatStreamDisplay()
             } else if (data.type === 'error') {
               message.error(data.message || '对话出错')
               setIsStreaming(false)
-              setStreamingContent('')
+              clearChatStreamDisplay()
             }
           } catch (e) {
             console.error('SSE parse error', e)
@@ -545,12 +592,20 @@ const Debug: React.FC = () => {
         const { done, value } = await reader.read()
         if (done) break
         if (abortController.signal.aborted) break
-        parser.feed(decoder.decode(value))
+        const chunk = decoder.decode(value, { stream: true })
+        if (chunk) parser.feed(chunk)
+      }
+
+      if (!abortController.signal.aborted) {
+        const remainingChunk = decoder.decode()
+        if (remainingChunk) parser.feed(remainingChunk)
       }
 
       // 流结束但没收到 done 事件：将已有内容保存为消息
       if (abortController.signal.aborted) {
         shouldFollowScrollRef.current = false
+      } else if (!hasFinalizedAssistantMessage) {
+        flushChatStreamContent()
       }
       appendAssistantMessage()
     } catch (error) {
@@ -564,8 +619,11 @@ const Debug: React.FC = () => {
       if (chatAbortControllerRef.current === abortController) {
         chatAbortControllerRef.current = null
       }
+      cancelChatStreamFrame()
       setIsStreaming(false)
       setStreamingContent('')
+      chatStreamContentRef.current = ''
+      chatStreamDisplayBufferRef.current = ''
     }
   }
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { CheckOutlined, CopyOutlined } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
@@ -6,6 +6,7 @@ import rehypeHighlight from 'rehype-highlight'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkGfm from 'remark-gfm'
+import { repairMarkdownDisplayContent } from '../utils/streamingContentRepair'
 import './MarkdownRenderer.css'
 
 interface MarkdownRendererProps {
@@ -153,31 +154,35 @@ const CodeBlock = ({ children }: { children: ReactNode }) => {
   )
 }
 
-const MarkdownRenderer = ({ content, className }: MarkdownRendererProps) => (
-  <div className={['markdown-renderer', className].filter(Boolean).join(' ')}>
-    <ReactMarkdown
-      remarkPlugins={remarkPlugins}
-      rehypePlugins={rehypePlugins}
-      components={{
-        pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
-        table: ({ children, ...props }) => (
-          <div className="markdown-table-scroll">
-            <table {...props}>{children}</table>
-          </div>
-        ),
-        a: ({ children, ...props }) => (
-          <a {...props} target="_blank" rel="noreferrer noopener">
-            {children}
-          </a>
-        ),
-        img: ({ alt, ...props }) => (
-          <img {...props} alt={alt || ''} loading="lazy" referrerPolicy="no-referrer" />
-        ),
-      }}
-    >
-      {content}
-    </ReactMarkdown>
-  </div>
-)
+const MarkdownRenderer = ({ content, className }: MarkdownRendererProps) => {
+  const displayContent = useMemo(() => repairMarkdownDisplayContent(content), [content])
+
+  return (
+    <div className={['markdown-renderer', className].filter(Boolean).join(' ')}>
+      <ReactMarkdown
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={rehypePlugins}
+        components={{
+          pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
+          table: ({ children, ...props }) => (
+            <div className="markdown-table-scroll">
+              <table {...props}>{children}</table>
+            </div>
+          ),
+          a: ({ children, ...props }) => (
+            <a {...props} target="_blank" rel="noreferrer noopener">
+              {children}
+            </a>
+          ),
+          img: ({ alt, ...props }) => (
+            <img {...props} alt={alt || ''} loading="lazy" referrerPolicy="no-referrer" />
+          ),
+        }}
+      >
+        {displayContent}
+      </ReactMarkdown>
+    </div>
+  )
+}
 
 export default MarkdownRenderer

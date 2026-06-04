@@ -91,6 +91,7 @@ const Layout: React.FC = () => {
 
   const selectedKey = '/' + (location.pathname.split('/')[1] || 'apps')
   const pageMeta = useMemo(() => routeMeta[selectedKey] || routeMeta['/apps'], [selectedKey])
+  const isEditorRoute = /^\/apps\/[^/]+\/editor\/?$/.test(location.pathname)
 
   return (
     <AntLayout className="layout-container">
@@ -180,8 +181,8 @@ const Layout: React.FC = () => {
           </div>
         </Header>
 
-        <Content className="content">
-          <div className="content-container">
+        <Content className={`content ${isEditorRoute ? 'content--editor' : ''}`}>
+          <div className={`content-container ${isEditorRoute ? 'content-container--editor' : ''}`}>
             <Outlet />
           </div>
         </Content>

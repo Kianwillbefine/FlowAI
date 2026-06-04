@@ -1,8 +1,9 @@
-import { useCallback, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { ReactFlow, 
   Background, 
   Controls, 
   MiniMap, 
+  useNodesInitialized,
   useReactFlow
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
@@ -72,13 +73,24 @@ const WorkflowCanvas: React.FC = () => {
     onNodesChange,
     onEdgesChange,
     onConnect,
+    currentWorkflow,
     setNodes,
     setSelectedNode, 
     executionStates 
   } = useStore()
 
   const reactFlowWrapper = useRef<HTMLDivElement>(null)
-  const { screenToFlowPosition } = useReactFlow()
+  const fittedWorkflowIdRef = useRef<string | null>(null)
+  const nodesInitialized = useNodesInitialized()
+  const { fitView, screenToFlowPosition } = useReactFlow()
+
+  useEffect(() => {
+    if (!currentWorkflow?.id || currentWorkflow.id === fittedWorkflowIdRef.current) return
+    if (!nodes.length || !nodesInitialized) return
+
+    fittedWorkflowIdRef.current = currentWorkflow.id
+    fitView({ padding: 0.2, duration: 200, maxZoom: 1.1 })
+  }, [currentWorkflow?.id, fitView, nodes.length, nodesInitialized])
 
   const onNodeClick = useCallback((event: React.MouseEvent, node: any) => {
     setSelectedNode(node)
